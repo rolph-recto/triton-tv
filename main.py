@@ -168,187 +168,188 @@ class Z3InterpreterContext:
     def tensor_type(self, domain: list[int], codomain: z3.Sort) -> list[z3.Sort]:
         return [z3.IntSort() for _ in range(len(domain))] + [codomain]
 
-    def interpret(self, stmt: OpStmt):
-        if isinstance(stmt.op, MakeRange):
-            assert stmt.op.start < stmt.op.end
+    def interpret(self, stmts: list[OpStmt]):
+        for stmt in stmts:
+            if isinstance(stmt.op, MakeRange):
+                assert stmt.op.start < stmt.op.end
 
-            n = stmt.op.end - stmt.op.start
-            f = z3.Function(stmt.id, z3.IntSort(), z3.IntSort())
+                n = stmt.op.end - stmt.op.start
+                f = z3.Function(stmt.id, z3.IntSort(), z3.IntSort())
 
-            # forall 0 <= v < n. f(v) = v + start
-            fdef = \
-                z3.ForAll([self.var[0]], \
+                # forall 0 <= v < n. f(v) = v + start
+                fdef = \
+                    z3.ForAll([self.var[0]], \
+                        z3.Implies( \
+                            z3.And(self.var[0] >= 0, self.var[0] < n), \
+                            f(self.var[0]) == self.var[0] + stmt.op.start))
+
+                self.solver.add(fdef)
+                self.store[stmt.id] = Value(f, TensorType(IntType(), [n]))
+
+            elif isinstance(stmt.op, Splat):
+                ptr = self.store[stmt.op.ptr]
+
+                assert isinstance(ptr.type, PointerType)
+
+                n = len(stmt.op.shape)
+                f = z3.Function(stmt.id, *([z3.IntSort() for _ in range(n)] + [ptr.type.as_z3()]))
+
+                # forall 0 <= v1 < s1, ..., 0 <= vn < sn. f(v1, ..., vn) == ptr
+                fdef = z3.ForAll(self.var[:n], \
                     z3.Implies( \
-                        z3.And(self.var[0] >= 0, self.var[0] < n), \
-                        f(self.var[0]) == self.var[0] + stmt.op.start))
+                        self.range_constraints(stmt.op.shape), \
+                        f(*[self.var[:n]]) == ptr.z3val))
 
-            self.solver.add(fdef)
-            self.store[stmt.id] = Value(f, TensorType(IntType(), [n]))
+                self.solver.add(fdef)
+                self.store[stmt.id] = Value(f, TensorType(ptr.type, stmt.op.shape))
 
-        elif isinstance(stmt.op, Splat):
-            ptr = self.store[stmt.op.ptr]
+            elif isinstance(stmt.op, AddPtr):
+                ptr = self.store[stmt.op.ptr]
+                offset = self.store[stmt.op.offset]
 
-            assert isinstance(ptr.type, PointerType)
+                assert isinstance(ptr.type, TensorType)
+                assert isinstance(ptr.type.base, PointerType)
+                assert isinstance(offset.type, TensorType)
+                assert isinstance(offset.type.base, IntType)
+                assert ptr.type.shape == offset.type.shape
 
-            n = len(stmt.op.shape)
-            f = z3.Function(stmt.id, *([z3.IntSort() for _ in range(n)] + [ptr.type.as_z3()]))
+                n = len(ptr.type.shape)
+                f = z3.Function(stmt.id, *ptr.type.lift_to_z3())
 
-            # forall 0 <= v1 < s1, ..., 0 <= vn < sn. f(v1, ..., vn) == ptr
-            fdef = z3.ForAll(self.var[:n], \
-                z3.Implies( \
-                    self.range_constraints(stmt.op.shape), \
-                    f(*[self.var[:n]]) == ptr.z3val))
+                # forall 0 <= v1 < s1, ..., 0 <= vn < sn. f(v1, ..., vn) == ptr(v1, ..., vn) + offset(v1, ..., vn)
+                fdef = z3.ForAll(self.var[:n], \
+                    z3.Implies( \
+                        self.range_constraints(ptr.type.shape),
+                        f(*[self.var[:n]]) == ptr.z3val(*self.var[:n]) + offset.z3val(*self.var[:n])))
 
-            self.solver.add(fdef)
-            self.store[stmt.id] = Value(f, TensorType(ptr.type, stmt.op.shape))
+                self.solver.add(fdef)
+                self.store[stmt.id] = Value(f, ptr.type)
 
-        elif isinstance(stmt.op, AddPtr):
-            ptr = self.store[stmt.op.ptr]
-            offset = self.store[stmt.op.offset]
+            elif isinstance(stmt.op, Load):
+                ptr = self.store[stmt.op.ptr]
 
-            assert isinstance(ptr.type, TensorType)
-            assert isinstance(ptr.type.base, PointerType)
-            assert isinstance(offset.type, TensorType)
-            assert isinstance(offset.type.base, IntType)
-            assert ptr.type.shape == offset.type.shape
+                assert isinstance(ptr.type, TensorType)
+                assert isinstance(ptr.type.base, PointerType)
 
-            n = len(ptr.type.shape)
-            f = z3.Function(stmt.id, *ptr.type.lift_to_z3())
+                n = len(ptr.type.shape)
+                f = z3.Function(stmt.id, *self.tensor_type(ptr.type.shape, ptr.type.base.base.as_z3()))
 
-            # forall 0 <= v1 < s1, ..., 0 <= vn < sn. f(v1, ..., vn) == ptr(v1, ..., vn) + offset(v1, ..., vn)
-            fdef = z3.ForAll(self.var[:n], \
-                z3.Implies( \
-                    self.range_constraints(ptr.type.shape),
-                    f(*[self.var[:n]]) == ptr.z3val(*self.var[:n]) + offset.z3val(*self.var[:n])))
+                # forall 0 <= v1 < s1, ..., 0 <= vn < sn. f(v1, ..., vn) == mem(ptr(v1, ..., vn))
+                fdef = z3.ForAll(self.var[:n], \
+                    z3.Implies( \
+                        self.range_constraints(ptr.type.shape),
+                        f(*[self.var[:n]]) == self.mem(ptr.z3val(*self.var[:n]))))
 
-            self.solver.add(fdef)
-            self.store[stmt.id] = Value(f, ptr.type)
+                self.solver.add(fdef)
+                self.store[stmt.id] = Value(f, TensorType(ptr.type.base.base, ptr.type.shape))
 
-        elif isinstance(stmt.op, Load):
-            ptr = self.store[stmt.op.ptr]
+            elif isinstance(stmt.op, Store):
+                ptr = self.store[stmt.op.ptr]
+                val = self.store[stmt.op.val]
 
-            assert isinstance(ptr.type, TensorType)
-            assert isinstance(ptr.type.base, PointerType)
+                assert isinstance(ptr.type, TensorType)
+                assert isinstance(ptr.type.base, PointerType)
+                assert isinstance(val.type, TensorType)
+                assert ptr.type.base.base == val.type.base
+                assert ptr.type.shape == val.type.shape
 
-            n = len(ptr.type.shape)
-            f = z3.Function(stmt.id, *self.tensor_type(ptr.type.shape, ptr.type.base.base.as_z3()))
+                n = len(ptr.type.shape)
+                self.mem_version += 1
+                new_mem = z3.Function(f"__mem{self.mem_version}__", z3.IntSort(), z3.IntSort())
 
-            # forall 0 <= v1 < s1, ..., 0 <= vn < sn. f(v1, ..., vn) == mem(ptr(v1, ..., vn))
-            fdef = z3.ForAll(self.var[:n], \
-                z3.Implies( \
-                    self.range_constraints(ptr.type.shape),
-                    f(*[self.var[:n]]) == self.mem(ptr.z3val(*self.var[:n]))))
-
-            self.solver.add(fdef)
-            self.store[stmt.id] = Value(f, TensorType(ptr.type.base.base, ptr.type.shape))
-
-        elif isinstance(stmt.op, Store):
-            ptr = self.store[stmt.op.ptr]
-            val = self.store[stmt.op.val]
-
-            assert isinstance(ptr.type, TensorType)
-            assert isinstance(ptr.type.base, PointerType)
-            assert isinstance(val.type, TensorType)
-            assert ptr.type.base.base == val.type.base
-            assert ptr.type.shape == val.type.shape
-
-            n = len(ptr.type.shape)
-            self.mem_version += 1
-            new_mem = z3.Function(f"__mem{self.mem_version}__", z3.IntSort(), z3.IntSort())
-
-            # forall x, 0 <= v1 < s1, ..., 0 <= vn < sn.
-            #   new_mem(x) == ite(x == ptr(v1, ..., vn), val(v1, ..., vn), mem(x))
-            memdef = z3.ForAll(self.var[:n+1], \
-                z3.Implies(
-                    self.range_constraints(ptr.type.shape),
-                    new_mem(self.var[n]) ==
-                        z3.If(self.var[n] == ptr.z3val(*self.var[:n]),
-                            val.z3val(*self.var[:n]), \
-                            self.mem(self.var[n]))))
-
-            self.solver.add(memdef)
-            self.mem = new_mem
-
-        elif isinstance(stmt.op, Broadcast):
-            val = self.store[stmt.op.val]
-
-            assert isinstance(val.type, TensorType)
-            assert len(val.type.shape) == len(stmt.op.shape)
-
-            n = len(val.type.shape)
-            broadcast_dim = None
-            for i, d in enumerate(stmt.op.shape):
-                if val.type.shape[i] != d:
-                    if broadcast_dim is None:
-                        broadcast_dim = i
-
-                    else:
-                        assert f"multiple broadcast dims: {broadcast_dim} and {i}"
-
-            # output shape is the same as input shape
-            if broadcast_dim is None:
-                self.store[stmt.id] = val
-
-            else:
-                indices = self.var[:n][:]
-                indices[broadcast_dim] = 0
-
-                f = z3.Function(stmt.id, *self.tensor_type(stmt.op.shape, val.type.base.as_z3()))
-                fdef = z3.ForAll(self.var[:n],
+                # forall x, 0 <= v1 < s1, ..., 0 <= vn < sn.
+                #   new_mem(x) == ite(x == ptr(v1, ..., vn), val(v1, ..., vn), mem(x))
+                memdef = z3.ForAll(self.var[:n+1], \
                     z3.Implies(
-                        self.range_constraints(stmt.op.shape),
+                        self.range_constraints(ptr.type.shape),
+                        new_mem(self.var[n]) ==
+                            z3.If(self.var[n] == ptr.z3val(*self.var[:n]),
+                                val.z3val(*self.var[:n]), \
+                                self.mem(self.var[n]))))
+
+                self.solver.add(memdef)
+                self.mem = new_mem
+
+            elif isinstance(stmt.op, Broadcast):
+                val = self.store[stmt.op.val]
+
+                assert isinstance(val.type, TensorType)
+                assert len(val.type.shape) == len(stmt.op.shape)
+
+                n = len(val.type.shape)
+                broadcast_dim = None
+                for i, d in enumerate(stmt.op.shape):
+                    if val.type.shape[i] != d:
+                        if broadcast_dim is None:
+                            broadcast_dim = i
+
+                        else:
+                            assert f"multiple broadcast dims: {broadcast_dim} and {i}"
+
+                # output shape is the same as input shape
+                if broadcast_dim is None:
+                    self.store[stmt.id] = val
+
+                else:
+                    indices = self.var[:n][:]
+                    indices[broadcast_dim] = 0
+
+                    f = z3.Function(stmt.id, *self.tensor_type(stmt.op.shape, val.type.base.as_z3()))
+                    fdef = z3.ForAll(self.var[:n],
+                        z3.Implies(
+                            self.range_constraints(stmt.op.shape),
+                            f(*self.var[:n]) == val.z3val(*indices)))
+
+                    self.solver.add(fdef)
+                    self.store[stmt.id] = Value(f, TensorType(val.type.base, stmt.op.shape))
+
+            elif isinstance(stmt.op, Transpose):
+                val = self.store[stmt.op.val]
+
+                assert isinstance(val.type, TensorType)
+                assert len(val.type.shape) == len(stmt.op.order)
+
+                n = len(val.type.shape)
+                indices: list[z3.ArithRef] = []
+                for i in range(n):
+                    assert 0 <= stmt.op.order[i] and stmt.op.order[i] < n
+                    indices.append(self.var[stmt.op.order[i]])
+
+                output_shape = [val.type.shape[i] for i in stmt.op.order]
+                f = z3.Function(stmt.id, self.tensor_type(output_shape, val.type.base.as_z3()))
+                fdef = z3.ForAll(self.var[:n], \
+                    z3.Implies( \
+                        self.range_constraints(output_shape), \
                         f(*self.var[:n]) == val.z3val(*indices)))
 
                 self.solver.add(fdef)
-                self.store[stmt.id] = Value(f, TensorType(val.type.base, stmt.op.shape))
+                self.store[stmt.id] = Value(f, TensorType(val.type.base, output_shape))
 
-        elif isinstance(stmt.op, Transpose):
-            val = self.store[stmt.op.val]
+            elif isinstance(stmt.op, ExpandDims):
+                val = self.store[stmt.op.val]
 
-            assert isinstance(val.type, TensorType)
-            assert len(val.type.shape) == len(stmt.op.order)
+                assert isinstance(val.type, TensorType)
 
-            n = len(val.type.shape)
-            indices: list[z3.ArithRef] = []
-            for i in range(n):
-                assert 0 <= stmt.op.order[i] and stmt.op.order[i] < n
-                indices.append(self.var[stmt.op.order[i]])
+                n = len(val.type.shape)
+                nout = n + 1
+                assert 0 <= stmt.op.dim and stmt.op.dim <= n
 
-            output_shape = [val.type.shape[i] for i in stmt.op.order]
-            f = z3.Function(stmt.id, self.tensor_type(output_shape, val.type.base.as_z3()))
-            fdef = z3.ForAll(self.var[:n], \
-                z3.Implies( \
-                    self.range_constraints(output_shape), \
-                    f(*self.var[:n]) == val.z3val(*indices)))
+                output_shape = val.type.shape[:]
+                output_shape.insert(stmt.op.dim, 1)
 
-            self.solver.add(fdef)
-            self.store[stmt.id] = Value(f, TensorType(val.type.base, output_shape))
+                indices = self.var[:stmt.op.dim] + self.var[stmt.op.dim+1:nout]
 
-        elif isinstance(stmt.op, ExpandDims):
-            val = self.store[stmt.op.val]
+                f = z3.Function(stmt.id, self.tensor_type(output_shape, val.type.base.as_z3()))
+                fdef = z3.ForAll(self.var[:nout],
+                    z3.Implies(
+                        self.range_constraints(output_shape),
+                        f(*self.var[:nout]) == val.z3val(*indices)))
 
-            assert isinstance(val.type, TensorType)
+                self.solver.add(fdef)
+                self.store[stmt.id] = Value(f, TensorType(val.type.base, output_shape))
 
-            n = len(val.type.shape)
-            nout = n + 1
-            assert 0 <= stmt.op.dim and stmt.op.dim <= n
-
-            output_shape = val.type.shape[:]
-            output_shape.insert(stmt.op.dim, 1)
-
-            indices = self.var[:stmt.op.dim] + self.var[stmt.op.dim+1:nout]
-
-            f = z3.Function(stmt.id, self.tensor_type(output_shape, val.type.base.as_z3()))
-            fdef = z3.ForAll(self.var[:nout],
-                z3.Implies(
-                    self.range_constraints(output_shape),
-                    f(*self.var[:nout]) == val.z3val(*indices)))
-
-            self.solver.add(fdef)
-            self.store[stmt.id] = Value(f, TensorType(val.type.base, output_shape))
-
-        else:
-            assert False, f"Unknown statement type {stmt}"
+            else:
+                assert False, f"Unknown statement type {stmt}"
 
 def main():
     store = {
@@ -357,14 +358,16 @@ def main():
 
     ctx = Z3InterpreterContext(z3.Solver(), store)
 
-    ctx.interpret(OpStmt("i1", MakeRange(0, 1000)))
-    ctx.interpret(OpStmt("i2", Splat("a", [1000])))
-    ctx.interpret(OpStmt("i3", AddPtr("i2", "i1")))
-    ctx.interpret(OpStmt("i4", Store("i3", "i1")))
-    ctx.interpret(OpStmt("i5", Load("i3")))
-    ctx.interpret(OpStmt("i6", ExpandDims("i1", 1)))
-    ctx.interpret(OpStmt("i7", Broadcast("i6", [1000, 10])))
-    ctx.interpret(OpStmt("i8", Transpose("i7", [1, 0])))
+    ctx.interpret([
+        OpStmt("i1", MakeRange(0, 10)),
+        OpStmt("i2", Splat("a", [10])),
+        OpStmt("i3", AddPtr("i2", "i1")),
+        OpStmt("i4", Store("i3", "i1")),
+        OpStmt("i5", Load("i3")),
+        OpStmt("i6", ExpandDims("i1", 1)),
+        OpStmt("i7", Broadcast("i6", [10, 10])),
+        OpStmt("i8", Transpose("i7", [1, 0])),
+    ])
 
     i5n = len(ctx.store["i5"].type.shape)
     i8 = ctx.store["i8"].z3val
