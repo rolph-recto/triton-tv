@@ -1,3 +1,4 @@
+from typing import Optional, Union
 import z3
 
 # TYPES
@@ -89,7 +90,7 @@ class Op(AST):
     pass
 
 class OpStmt(Stmt):
-    def __init__(self, id: str, op: Op):
+    def __init__(self, id: Union[str,tuple[str,str]] , op: Op):
         self.id = id
         self.op = op
 
@@ -136,6 +137,16 @@ class Transpose(Op):
         self.val = val
         self.order = order
 
+class Dot(Op):
+    def __init__(self, a: str, b: str, c: Optional[str]=None):
+        self.a = a
+        self.b = b
+        self.c = c
+
+class Split(Op):
+    def __init__(self, val: str):
+        self.val = val
+
 # INTERPRETER
 
 class Value:
@@ -146,6 +157,8 @@ class Value:
 class Z3InterpreterContext:
     def __init__(self, solver: z3.Solver, store={}):
         self.solver = solver
+        self.solver.set(":unsat_core", True)
+        self.assertions = {}
 
         # map from variables to values
         self.store = store
@@ -155,7 +168,9 @@ class Z3InterpreterContext:
         self.mem = z3.Function(f"__mem{self.mem_version}__", z3.IntSort(), z3.IntSort())
 
         # assume that we won't have more ten 10-dimensional tensors
-        self.var = [z3.Int(f"i{i}") for i in range(10)]
+        self.var = [z3.Int(f"$i{i}") for i in range(10)]
+
+        self.set_math()
 
     def range_constraints(self, shape: list[int]):
         range_constrs = []
@@ -168,6 +183,26 @@ class Z3InterpreterContext:
     def tensor_type(self, domain: list[int], codomain: z3.Sort) -> list[z3.Sort]:
         return [z3.IntSort() for _ in range(len(domain))] + [codomain]
 
+    def set_math(self):
+        self.math = {}
+        exp = z3.Function("exp", z3.IntSort(), z3.IntSort())
+        self.solver.add(
+            z3.ForAll(self.var[:2],
+                exp(self.var[0] + self.var[1]) == exp(self.var[0]) * exp(self.var[1])))
+
+        self.solver.add(
+            z3.ForAll(self.var[:2],
+                exp(self.var[0] - self.var[1]) == exp(self.var[0]) / exp(self.var[1])))
+
+        self.solver.add(exp(0) == 1)
+
+        self.math["exp"] = exp
+
+    def add_assert(self, prop, id_str: str):
+        id = z3.Bool(f"$PROP_{id_str}")
+        self.solver.assert_and_track(prop, id)
+        self.assertions[id] = prop
+
     def interpret(self, stmts: list[OpStmt]):
         for stmt in stmts:
             if isinstance(stmt.op, MakeRange):
@@ -178,12 +213,12 @@ class Z3InterpreterContext:
 
                 # forall 0 <= v < n. f(v) = v + start
                 fdef = \
-                    z3.ForAll([self.var[0]], \
-                        z3.Implies( \
-                            z3.And(self.var[0] >= 0, self.var[0] < n), \
+                    z3.ForAll([self.var[0]],
+                        z3.Implies(
+                            z3.And(self.var[0] >= 0, self.var[0] < n),
                             f(self.var[0]) == self.var[0] + stmt.op.start))
 
-                self.solver.add(fdef)
+                self.add_assert(fdef, stmt.id)
                 self.store[stmt.id] = Value(f, TensorType(IntType(), [n]))
 
             elif isinstance(stmt.op, Splat):
@@ -195,12 +230,12 @@ class Z3InterpreterContext:
                 f = z3.Function(stmt.id, *([z3.IntSort() for _ in range(n)] + [ptr.type.as_z3()]))
 
                 # forall 0 <= v1 < s1, ..., 0 <= vn < sn. f(v1, ..., vn) == ptr
-                fdef = z3.ForAll(self.var[:n], \
-                    z3.Implies( \
-                        self.range_constraints(stmt.op.shape), \
+                fdef = z3.ForAll(self.var[:n],
+                    z3.Implies(
+                        self.range_constraints(stmt.op.shape),
                         f(*[self.var[:n]]) == ptr.z3val))
 
-                self.solver.add(fdef)
+                self.add_assert(fdef, stmt.id)
                 self.store[stmt.id] = Value(f, TensorType(ptr.type, stmt.op.shape))
 
             elif isinstance(stmt.op, AddPtr):
@@ -217,12 +252,12 @@ class Z3InterpreterContext:
                 f = z3.Function(stmt.id, *ptr.type.lift_to_z3())
 
                 # forall 0 <= v1 < s1, ..., 0 <= vn < sn. f(v1, ..., vn) == ptr(v1, ..., vn) + offset(v1, ..., vn)
-                fdef = z3.ForAll(self.var[:n], \
-                    z3.Implies( \
+                fdef = z3.ForAll(self.var[:n],
+                    z3.Implies(
                         self.range_constraints(ptr.type.shape),
                         f(*[self.var[:n]]) == ptr.z3val(*self.var[:n]) + offset.z3val(*self.var[:n])))
 
-                self.solver.add(fdef)
+                self.add_assert(fdef, stmt.id)
                 self.store[stmt.id] = Value(f, ptr.type)
 
             elif isinstance(stmt.op, Load):
@@ -235,12 +270,12 @@ class Z3InterpreterContext:
                 f = z3.Function(stmt.id, *self.tensor_type(ptr.type.shape, ptr.type.base.base.as_z3()))
 
                 # forall 0 <= v1 < s1, ..., 0 <= vn < sn. f(v1, ..., vn) == mem(ptr(v1, ..., vn))
-                fdef = z3.ForAll(self.var[:n], \
-                    z3.Implies( \
+                fdef = z3.ForAll(self.var[:n],
+                    z3.Implies(
                         self.range_constraints(ptr.type.shape),
                         f(*[self.var[:n]]) == self.mem(ptr.z3val(*self.var[:n]))))
 
-                self.solver.add(fdef)
+                self.add_assert(fdef, stmt.id)
                 self.store[stmt.id] = Value(f, TensorType(ptr.type.base.base, ptr.type.shape))
 
             elif isinstance(stmt.op, Store):
@@ -259,15 +294,15 @@ class Z3InterpreterContext:
 
                 # forall x, 0 <= v1 < s1, ..., 0 <= vn < sn.
                 #   new_mem(x) == ite(x == ptr(v1, ..., vn), val(v1, ..., vn), mem(x))
-                memdef = z3.ForAll(self.var[:n+1], \
+                memdef = z3.ForAll(self.var[:n+1],
                     z3.Implies(
                         self.range_constraints(ptr.type.shape),
                         new_mem(self.var[n]) ==
                             z3.If(self.var[n] == ptr.z3val(*self.var[:n]),
-                                val.z3val(*self.var[:n]), \
+                                val.z3val(*self.var[:n]),
                                 self.mem(self.var[n]))))
 
-                self.solver.add(memdef)
+                self.add_assert(memdef, stmt.id)
                 self.mem = new_mem
 
             elif isinstance(stmt.op, Broadcast):
@@ -295,12 +330,15 @@ class Z3InterpreterContext:
                     indices[broadcast_dim] = 0
 
                     f = z3.Function(stmt.id, *self.tensor_type(stmt.op.shape, val.type.base.as_z3()))
+
+                    # let vi be the broadcast dimension; then
+                    # forall v1, ..., vn. f(v1, ..., vn) == val(v1, ..., 0, ..., vn)
                     fdef = z3.ForAll(self.var[:n],
                         z3.Implies(
                             self.range_constraints(stmt.op.shape),
                             f(*self.var[:n]) == val.z3val(*indices)))
 
-                    self.solver.add(fdef)
+                    self.add_assert(fdef, stmt.id)
                     self.store[stmt.id] = Value(f, TensorType(val.type.base, stmt.op.shape))
 
             elif isinstance(stmt.op, Transpose):
@@ -317,12 +355,15 @@ class Z3InterpreterContext:
 
                 output_shape = [val.type.shape[i] for i in stmt.op.order]
                 f = z3.Function(stmt.id, self.tensor_type(output_shape, val.type.base.as_z3()))
-                fdef = z3.ForAll(self.var[:n], \
-                    z3.Implies( \
-                        self.range_constraints(output_shape), \
+
+                # let pi be the permutation induced by order; then
+                # forall v1, ..., vn. f(v1, ..., vn) == val(v_pi(1), ..., v_pi(n))
+                fdef = z3.ForAll(self.var[:n],
+                    z3.Implies(
+                        self.range_constraints(output_shape),
                         f(*self.var[:n]) == val.z3val(*indices)))
 
-                self.solver.add(fdef)
+                self.add_assert(fdef, stmt.id)
                 self.store[stmt.id] = Value(f, TensorType(val.type.base, output_shape))
 
             elif isinstance(stmt.op, ExpandDims):
@@ -340,13 +381,88 @@ class Z3InterpreterContext:
                 indices = self.var[:stmt.op.dim] + self.var[stmt.op.dim+1:nout]
 
                 f = z3.Function(stmt.id, self.tensor_type(output_shape, val.type.base.as_z3()))
+
+                # let i be the newly added dim; then
+                # forall v1, ..., vn. f(v1, ..., vn) == val(v1, ..., v{i-1}, v{i+1}, ..., vn)
                 fdef = z3.ForAll(self.var[:nout],
                     z3.Implies(
                         self.range_constraints(output_shape),
                         f(*self.var[:nout]) == val.z3val(*indices)))
-
-                self.solver.add(fdef)
+                
+                self.add_assert(fdef, stmt.id)
                 self.store[stmt.id] = Value(f, TensorType(val.type.base, output_shape))
+
+            elif isinstance(stmt.op, Dot):
+                a = self.store[stmt.op.a]
+                b = self.store[stmt.op.b]
+                c = self.store[stmt.op.c] if stmt.op.c is not None else None
+
+                assert isinstance(a.type, TensorType)
+                assert isinstance(a.type.base, BaseType)
+                assert isinstance(b.type, TensorType)
+                assert isinstance(b.type.base, BaseType)
+                assert a.type.base == b.type.base
+                assert len(a.type.shape) == 2 and len(b.type.shape) == 2
+                assert a.type.shape[1] == b.type.shape[0]
+
+                output_shape = [a.type.shape[0], b.type.shape[1]]
+
+                fname = stmt.id if c is None else f"{stmt.id}_2"
+                f = z3.Function(fname, z3.IntSort(), z3.IntSort(), a.type.base.as_z3())
+
+                # forall x, y. f(x, y) == a(x,0)*b(0,y) + ... + a(x,k)*b(k,y)
+                sum_def = [a.z3val(self.var[0], i)*b.z3val(i, self.var[1]) for i in range(a.type.shape[1])]
+                fdef = z3.ForAll(self.var[:2],
+                    z3.Implies(
+                        self.range_constraints(output_shape),
+                        f(*self.var[:2]) == z3.Sum(*sum_def)))
+
+                self.add_assert(fdef, fname)
+
+                if c is None:
+                    self.store[stmt.id] = f
+
+                else:
+                    assert isinstance(c.type, TensorType)
+                    assert a.type.base == c.type.base
+                    assert c.type.shape == output_shape
+
+                    g = z3.Function(stmt.id, z3.IntSort(), z3.IntSort(), c.type.base.as_z3())
+                    # forall x, y. g(x,y) == f(x,y) + c(x,y)
+                    gdef = z3.ForAll(self.var[:2],
+                        z3.Implies(
+                            self.range_constraints(output_shape),
+                            g(*self.var[:2]) == f(*self.var[:2]) + c.z3var(*self.var[:2])))
+
+                    self.add_assert(gdef, stmt.id)
+                    self.store[stmt.id] = Value(g, TensorType(a.type.base, output_shape))
+
+            elif isinstance(stmt.op, Split):
+                val = self.store[stmt.op.val]
+
+                assert isinstance(val.type, TensorType)
+                assert val.type.shape[-1] == 2
+                assert isinstance(stmt.id, tuple)
+                assert len(stmt.id) == 2
+
+                n = len(val.type.shape)
+                f1 = z3.Function(stmt.id[0], *self.tensor_type(val.type.shape[:-1], val.type.base.as_z3()))
+                f1def = z3.ForAll(self.var[:n-1],
+                    z3.Implies(
+                        self.range_constraints(val.type.shape[:-1]),
+                        f1(*self.var[:n-1]) == val.z3val(*(self.var[:n-1] + [0]))))
+
+                self.add_assert(f1def, stmt.id[0])
+                self.store[stmt.id[0]] = Value(f1, TensorType(val.type.base, val.type.shape[:-1]))
+
+                f2 = z3.Function(stmt.id[1], *self.tensor_type(val.type.shape[:-1], val.type.base.as_z3()))
+                f2def = z3.ForAll(self.var[:n-1],
+                    z3.Implies(
+                        self.range_constraints(val.type.shape[:-1]),
+                        f2(*self.var[:n-1]) == val.z3val(*(self.var[:n-1] + [1]))))
+
+                self.add_assert(f2def, stmt.id[1])
+                self.store[stmt.id[1]] = Value(f2, TensorType(val.type.base, val.type.shape[:-1]))
 
             else:
                 assert False, f"Unknown statement type {stmt}"
@@ -365,32 +481,52 @@ def main():
         OpStmt("i4", Store("i3", "i1")),
         OpStmt("i5", Load("i3")),
         OpStmt("i6", ExpandDims("i1", 1)),
-        OpStmt("i7", Broadcast("i6", [10, 10])),
+        OpStmt("i7", Broadcast("i6", [10, 2])),
         OpStmt("i8", Transpose("i7", [1, 0])),
+        OpStmt(("i9_1", "i9_2"), Split("i7")),
     ])
 
     i5n = len(ctx.store["i5"].type.shape)
     i8 = ctx.store["i8"].z3val
 
     # check invariants
-    ctx.solver.add( \
-        z3.Not(z3.And( \
+    ctx.solver.add(
+        z3.Not(z3.And(
             # i1 == i5
-            z3.ForAll(ctx.var[:i5n], \
-                z3.Implies( \
-                    ctx.range_constraints(ctx.store["i5"].type.shape), \
+            z3.ForAll(ctx.var[:i5n],
+                z3.Implies(
+                    ctx.range_constraints(ctx.store["i5"].type.shape),
                     ctx.store["i5"].z3val(*ctx.var[:i5n]) == ctx.store["i1"].z3val(*ctx.var[:i5n]))),
 
-            # forall y. i8[0,y] == i8[1,y]
-            z3.ForAll([ctx.var[1]], \
-                i8(0, ctx.var[1]) == i8(1, ctx.var[1])))))
+            # i1 == i9_1
+            z3.ForAll(ctx.var[:i5n],
+                z3.Implies(
+                    ctx.range_constraints(ctx.store["i9_1"].type.shape),
+                    ctx.store["i9_1"].z3val(*ctx.var[:i5n]) == ctx.store["i1"].z3val(*ctx.var[:i5n]))),
 
+            # i9_1 == i9_2
+            z3.ForAll(ctx.var[:i5n],
+                z3.Implies(
+                    ctx.range_constraints(ctx.store["i9_1"].type.shape),
+                    ctx.store["i9_1"].z3val(*ctx.var[:i5n]) == ctx.store["i9_2"].z3val(*ctx.var[:i5n]))),
+
+            # forall y. i8[0,y] == i8[1,y]
+            z3.ForAll([ctx.var[0], ctx.var[1]],
+                z3.Implies(
+                    ctx.range_constraints(ctx.store["i8"].type.shape),
+                    i8(0, ctx.var[1]) == i8(1, ctx.var[1]))))))
+
+    print(ctx.solver.sexpr())
+    print("solving...")
     if ctx.solver.check() == z3.sat:
         print("Satisfiable")
         print(ctx.solver.model())
 
     else:
         print("Unsatisfiable")
+        print("Unsat core:")
+        for prop in ctx.solver.unsat_core():
+            print(prop, ":", ctx.assertions[prop])
 
 if __name__ == "__main__":
     main()
